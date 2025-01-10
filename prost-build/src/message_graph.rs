@@ -4,7 +4,12 @@ use petgraph::algo::has_path_connecting;
 use petgraph::graph::NodeIndex;
 use petgraph::Graph;
 
-use prost_types::{field_descriptor_proto, DescriptorProto, FileDescriptorProto};
+use prost_types::{
+    field_descriptor_proto::{Label, Type},
+    DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+};
+
+use crate::path::PathMap;
 
 /// `MessageGraph` builds a graph of messages whose edges correspond to nesting.
 /// The goal is to recognize when message types are recursively nested, so
@@ -12,15 +17,20 @@ use prost_types::{field_descriptor_proto, DescriptorProto, FileDescriptorProto};
 pub struct MessageGraph {
     index: HashMap<String, NodeIndex>,
     graph: Graph<String, ()>,
+    messages: HashMap<String, DescriptorProto>,
+    boxed: PathMap<()>,
 }
 
 impl MessageGraph {
-    pub fn new<'a>(
+    pub(crate) fn new<'a>(
         files: impl Iterator<Item = &'a FileDescriptorProto>,
-    ) -> Result<MessageGraph, String> {
+        boxed: PathMap<()>,
+    ) -> MessageGraph {
         let mut msg_graph = MessageGraph {
             index: HashMap::new(),
             graph: Graph::new(),
+            messages: HashMap::new(),
+            boxed,
         };
 
         for file in files {
@@ -34,13 +44,14 @@ impl MessageGraph {
             }
         }
 
-        Ok(msg_graph)
+        msg_graph
     }
 
     fn get_or_insert_index(&mut self, msg_name: String) -> NodeIndex {
         let MessageGraph {
             ref mut index,
             ref mut graph,
+            ..
         } = *self;
         assert_eq!(b'.', msg_name.as_bytes()[0]);
         *index
@@ -58,17 +69,21 @@ impl MessageGraph {
         let msg_index = self.get_or_insert_index(msg_name.clone());
 
         for field in &msg.field {
-            if field.r#type() == field_descriptor_proto::Type::Message
-                && field.label() != field_descriptor_proto::Label::Repeated
-            {
+            if field.r#type() == Type::Message && field.label() != Label::Repeated {
                 let field_index = self.get_or_insert_index(field.type_name.clone().unwrap());
                 self.graph.add_edge(msg_index, field_index, ());
             }
         }
+        self.messages.insert(msg_name.clone(), msg.clone());
 
         for msg in &msg.nested_type {
             self.add_message(&msg_name, msg);
         }
+    }
+
+    /// Try get a message descriptor from current message graph
+    pub fn get_message(&self, message: &str) -> Option<&DescriptorProto> {
+        self.messages.get(message)
     }
 
     /// Returns true if message type `inner` is nested in message type `outer`.
@@ -83,5 +98,59 @@ impl MessageGraph {
         };
 
         has_path_connecting(&self.graph, outer, inner, None)
+    }
+
+    /// Returns `true` if this message can automatically derive Copy trait.
+    pub fn can_message_derive_copy(&self, fq_message_name: &str) -> bool {
+        assert_eq!(".", &fq_message_name[..1]);
+        self.get_message(fq_message_name)
+            .unwrap()
+            .field
+            .iter()
+            .all(|field| self.can_field_derive_copy(fq_message_name, field))
+    }
+
+    /// Returns `true` if the type of this field allows deriving the Copy trait.
+    pub fn can_field_derive_copy(
+        &self,
+        fq_message_name: &str,
+        field: &FieldDescriptorProto,
+    ) -> bool {
+        assert_eq!(".", &fq_message_name[..1]);
+
+        // repeated field cannot derive Copy
+        if field.label() == Label::Repeated {
+            false
+        } else if field.r#type() == Type::Message {
+            // nested and boxed messages cannot derive Copy
+            if self.is_nested(field.type_name(), fq_message_name)
+                || self
+                    .boxed
+                    .get_first_field(fq_message_name, field.name())
+                    .is_some()
+            {
+                false
+            } else {
+                self.can_message_derive_copy(field.type_name())
+            }
+        } else {
+            matches!(
+                field.r#type(),
+                Type::Float
+                    | Type::Double
+                    | Type::Int32
+                    | Type::Int64
+                    | Type::Uint32
+                    | Type::Uint64
+                    | Type::Sint32
+                    | Type::Sint64
+                    | Type::Fixed32
+                    | Type::Fixed64
+                    | Type::Sfixed32
+                    | Type::Sfixed64
+                    | Type::Bool
+                    | Type::Enum
+            )
+        }
     }
 }

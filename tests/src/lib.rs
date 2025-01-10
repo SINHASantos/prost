@@ -13,7 +13,6 @@ extern crate alloc;
 cfg_if! {
     if #[cfg(feature = "edition-2015")] {
         extern crate anyhow;
-        extern crate bytes;
         extern crate core;
         extern crate prost;
         extern crate prost_types;
@@ -25,6 +24,7 @@ cfg_if! {
     }
 }
 
+pub mod decode_error;
 pub mod extern_paths;
 pub mod no_root_packages;
 pub mod packages;
@@ -37,16 +37,40 @@ mod debug;
 #[cfg(test)]
 mod deprecated_field;
 #[cfg(test)]
+mod derive_copy;
+#[cfg(test)]
+mod enum_keyword_variant;
+#[cfg(test)]
 mod generic_derive;
 #[cfg(test)]
 mod message_encoding;
 #[cfg(test)]
+mod no_shadowed_types;
+#[cfg(test)]
 mod no_unused_results;
 #[cfg(test)]
-#[cfg(feature = "std")]
-mod skip_debug;
+mod submessage_without_package;
 #[cfg(test)]
 mod type_names;
+
+#[cfg(test)]
+mod boxed_field;
+
+#[cfg(test)]
+mod custom_debug;
+
+// Must be `pub` as doc tests are only executed on public types.
+pub mod disable_comments;
+
+#[cfg(test)]
+// Must be `pub` as `missing_docs` lint is only executed on public types.
+pub mod custom_attributes;
+
+#[cfg(test)]
+mod default_enum_value;
+
+#[cfg(test)]
+mod nesting;
 
 mod test_enum_named_option_value {
     include!(concat!(env!("OUT_DIR"), "/myenum.optionn.rs"));
@@ -70,33 +94,8 @@ pub mod foo {
     }
 }
 
-pub mod nesting {
-    include!(concat!(env!("OUT_DIR"), "/nesting.rs"));
-}
-
 pub mod recursive_oneof {
     include!(concat!(env!("OUT_DIR"), "/recursive_oneof.rs"));
-}
-
-#[cfg(feature = "std")]
-pub mod custom_debug {
-    use std::fmt;
-    include!(concat!(env!("OUT_DIR"), "/custom_debug.rs"));
-    impl fmt::Debug for Msg {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("Msg {..}")
-        }
-    }
-}
-
-/// This tests the custom attributes support by abusing docs.
-///
-/// Docs really are full-blown attributes. So we use them to ensure we can place them on everything
-/// we need. If they aren't put onto something or allowed not to be there (by the generator),
-/// compilation fails.
-#[deny(missing_docs)]
-pub mod custom_attributes {
-    include!(concat!(env!("OUT_DIR"), "/foo.custom.attrs.rs"));
 }
 
 /// Also for testing custom attributes, but on oneofs.
@@ -106,14 +105,6 @@ pub mod custom_attributes {
 /// in a separate file.
 pub mod oneof_attributes {
     include!(concat!(env!("OUT_DIR"), "/foo.custom.one_of_attrs.rs"));
-}
-
-/// Issue https://github.com/tokio-rs/prost/issues/118
-///
-/// When a message contains an enum field with a default value, we
-/// must ensure that the appropriate name conventions are used.
-pub mod default_enum_value {
-    include!(concat!(env!("OUT_DIR"), "/default_enum_value.rs"));
 }
 
 pub mod groups {
@@ -126,16 +117,11 @@ pub mod proto3 {
     }
 }
 
-pub mod invalid {
-    pub mod doctest {
-        include!(concat!(env!("OUT_DIR"), "/invalid.doctest.rs"));
-    }
-}
-
 pub mod default_string_escape {
     include!(concat!(env!("OUT_DIR"), "/default_string_escape.rs"));
 }
 
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
 use anyhow::anyhow;
@@ -195,8 +181,9 @@ where
 
     let mut buf1 = Vec::new();
     if let Err(error) = all_types.encode(&mut buf1) {
-        return RoundtripResult::Error(error.into());
+        return RoundtripResult::Error(anyhow!(error));
     }
+    let buf1 = buf1;
     if encoded_len != buf1.len() {
         return RoundtripResult::Error(anyhow!(
             "expected encoded len ({}) did not match actual encoded len ({})",
@@ -205,15 +192,16 @@ where
         ));
     }
 
-    let roundtrip = match M::decode(&*buf1) {
+    let roundtrip = match M::decode(buf1.as_slice()) {
         Ok(roundtrip) => roundtrip,
-        Err(error) => return RoundtripResult::Error(anyhow::Error::new(error)),
+        Err(error) => return RoundtripResult::Error(anyhow!(error)),
     };
 
     let mut buf2 = Vec::new();
     if let Err(error) = roundtrip.encode(&mut buf2) {
-        return RoundtripResult::Error(error.into());
+        return RoundtripResult::Error(anyhow!(error));
     }
+    let buf2 = buf2;
     let buf3 = roundtrip.encode_to_vec();
 
     /*
@@ -247,7 +235,7 @@ where
     msg.encode(&mut buf).unwrap();
     assert_eq!(expected_len, buf.len());
 
-    let mut buf = &*buf;
+    let mut buf = buf.as_slice();
     let roundtrip = M::decode(&mut buf).unwrap();
 
     assert!(
@@ -274,11 +262,10 @@ where
 #[cfg(test)]
 mod tests {
 
-    use alloc::borrow::ToOwned;
-    use alloc::boxed::Box;
     use alloc::collections::{BTreeMap, BTreeSet};
-    use alloc::string::ToString;
     use alloc::vec;
+    #[cfg(not(feature = "std"))]
+    use alloc::{boxed::Box, string::ToString};
 
     use super::*;
 
@@ -402,40 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn test_nesting() {
-        use crate::nesting::{A, B};
-        let _ = A {
-            a: Some(Box::new(A::default())),
-            repeated_a: Vec::<A>::new(),
-            map_a: BTreeMap::<i32, A>::new(),
-            b: Some(Box::new(B::default())),
-            repeated_b: Vec::<B>::new(),
-            map_b: BTreeMap::<i32, B>::new(),
-        };
-    }
-
-    #[test]
-    fn test_deep_nesting() {
-        fn build_and_roundtrip(depth: usize) -> Result<(), prost::DecodeError> {
-            use crate::nesting::A;
-
-            let mut a = Box::new(A::default());
-            for _ in 0..depth {
-                let mut next = Box::new(A::default());
-                next.a = Some(a);
-                a = next;
-            }
-
-            let mut buf = Vec::new();
-            a.encode(&mut buf).unwrap();
-            A::decode(&*buf).map(|_| ())
-        }
-
-        assert!(build_and_roundtrip(100).is_ok());
-        assert!(build_and_roundtrip(101).is_err());
-    }
-
-    #[test]
     fn test_deep_nesting_oneof() {
         fn build_and_roundtrip(depth: usize) -> Result<(), prost::DecodeError> {
             use crate::recursive_oneof::{a, A, C};
@@ -451,7 +404,7 @@ mod tests {
 
             let mut buf = Vec::new();
             a.encode(&mut buf).unwrap();
-            A::decode(&*buf).map(|_| ())
+            A::decode(buf.as_slice()).map(|_| ())
         }
 
         assert!(build_and_roundtrip(99).is_ok());
@@ -474,49 +427,7 @@ mod tests {
 
             let mut buf = Vec::new();
             a.encode(&mut buf).unwrap();
-            NestedGroup2::decode(&*buf).map(|_| ())
-        }
-
-        assert!(build_and_roundtrip(50).is_ok());
-        assert!(build_and_roundtrip(51).is_err());
-    }
-
-    #[test]
-    fn test_deep_nesting_repeated() {
-        fn build_and_roundtrip(depth: usize) -> Result<(), prost::DecodeError> {
-            use crate::nesting::C;
-
-            let mut c = C::default();
-            for _ in 0..depth {
-                let mut next = C::default();
-                next.r.push(c);
-                c = next;
-            }
-
-            let mut buf = Vec::new();
-            c.encode(&mut buf).unwrap();
-            C::decode(&*buf).map(|_| ())
-        }
-
-        assert!(build_and_roundtrip(100).is_ok());
-        assert!(build_and_roundtrip(101).is_err());
-    }
-
-    #[test]
-    fn test_deep_nesting_map() {
-        fn build_and_roundtrip(depth: usize) -> Result<(), prost::DecodeError> {
-            use crate::nesting::D;
-
-            let mut d = D::default();
-            for _ in 0..depth {
-                let mut next = D::default();
-                next.m.insert("foo".to_owned(), d);
-                d = next;
-            }
-
-            let mut buf = Vec::new();
-            d.encode(&mut buf).unwrap();
-            D::decode(&*buf).map(|_| ())
+            NestedGroup2::decode(buf.as_slice()).map(|_| ())
         }
 
         assert!(build_and_roundtrip(50).is_ok());
@@ -543,95 +454,6 @@ mod tests {
         // https://github.com/tokio-rs/prost/issues/267
         let buf = vec![b'C'; 1 << 20];
         <() as Message>::decode(&buf[..]).err().unwrap();
-    }
-
-    #[test]
-    fn test_default_enum() {
-        let msg = default_enum_value::Test::default();
-        assert_eq!(msg.privacy_level_1(), default_enum_value::PrivacyLevel::One);
-        assert_eq!(
-            msg.privacy_level_3(),
-            default_enum_value::PrivacyLevel::PrivacyLevelThree
-        );
-        assert_eq!(
-            msg.privacy_level_4(),
-            default_enum_value::PrivacyLevel::PrivacyLevelprivacyLevelFour
-        );
-    }
-
-    #[test]
-    fn test_enum_to_string() {
-        use default_enum_value::{ERemoteClientBroadcastMsg, PrivacyLevel};
-
-        assert_eq!(PrivacyLevel::One.as_str_name(), "PRIVACY_LEVEL_ONE");
-        assert_eq!(PrivacyLevel::Two.as_str_name(), "PRIVACY_LEVEL_TWO");
-        assert_eq!(
-            PrivacyLevel::PrivacyLevelThree.as_str_name(),
-            "PRIVACY_LEVEL_PRIVACY_LEVEL_THREE"
-        );
-        assert_eq!(
-            PrivacyLevel::PrivacyLevelprivacyLevelFour.as_str_name(),
-            "PRIVACY_LEVELPRIVACY_LEVEL_FOUR"
-        );
-
-        assert_eq!(
-            ERemoteClientBroadcastMsg::KERemoteClientBroadcastMsgDiscovery.as_str_name(),
-            "k_ERemoteClientBroadcastMsgDiscovery"
-        );
-    }
-
-    #[test]
-    fn test_enum_from_string() {
-        use default_enum_value::{ERemoteClientBroadcastMsg, PrivacyLevel};
-
-        assert_eq!(
-            Some(PrivacyLevel::One),
-            PrivacyLevel::from_str_name("PRIVACY_LEVEL_ONE")
-        );
-        assert_eq!(
-            Some(PrivacyLevel::Two),
-            PrivacyLevel::from_str_name("PRIVACY_LEVEL_TWO")
-        );
-        assert_eq!(
-            Some(PrivacyLevel::PrivacyLevelThree),
-            PrivacyLevel::from_str_name("PRIVACY_LEVEL_PRIVACY_LEVEL_THREE")
-        );
-        assert_eq!(
-            Some(PrivacyLevel::PrivacyLevelprivacyLevelFour),
-            PrivacyLevel::from_str_name("PRIVACY_LEVELPRIVACY_LEVEL_FOUR")
-        );
-        assert_eq!(None, PrivacyLevel::from_str_name("PRIVACY_LEVEL_FIVE"));
-
-        assert_eq!(
-            Some(ERemoteClientBroadcastMsg::KERemoteClientBroadcastMsgDiscovery),
-            ERemoteClientBroadcastMsg::from_str_name("k_ERemoteClientBroadcastMsgDiscovery")
-        );
-    }
-
-    #[test]
-    fn test_enum_try_from_i32() {
-        use core::convert::TryFrom;
-        use default_enum_value::{ERemoteClientBroadcastMsg, PrivacyLevel};
-
-        assert_eq!(Ok(PrivacyLevel::One), PrivacyLevel::try_from(1));
-        assert_eq!(Ok(PrivacyLevel::Two), PrivacyLevel::try_from(2));
-        assert_eq!(
-            Ok(PrivacyLevel::PrivacyLevelThree),
-            PrivacyLevel::try_from(3)
-        );
-        assert_eq!(
-            Ok(PrivacyLevel::PrivacyLevelprivacyLevelFour),
-            PrivacyLevel::try_from(4)
-        );
-        assert_eq!(
-            Err(prost::DecodeError::new("invalid enumeration value")),
-            PrivacyLevel::try_from(5)
-        );
-
-        assert_eq!(
-            Ok(ERemoteClientBroadcastMsg::KERemoteClientBroadcastMsgDiscovery),
-            ERemoteClientBroadcastMsg::try_from(0)
-        );
     }
 
     #[test]
@@ -679,7 +501,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         msg2.encode(&mut bytes).unwrap();
-        assert_eq!(&*bytes, msg2_bytes);
+        assert_eq!(bytes.as_slice(), msg2_bytes);
 
         assert_eq!(groups::Test2::decode(msg2_bytes), Ok(msg2));
     }
