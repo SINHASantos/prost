@@ -3,7 +3,9 @@
 //! The tests check against expected output. This may be a bit fragile, but it is likely OK for
 //! actual use.
 
-use prost::alloc::{format, string::String};
+use prost::alloc::format;
+#[cfg(not(feature = "std"))]
+use prost::alloc::string::String;
 
 // Borrow some types from other places.
 #[cfg(feature = "std")]
@@ -68,7 +70,6 @@ fn tuple_struct() {
     assert_eq!(format!("{:?}", NewType(42)), "NewType(42)");
 }
 
-#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub enum OneofWithEnum {
     #[prost(int32, tag = "8")]
